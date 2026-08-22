@@ -56,8 +56,10 @@ jobs:
           payload="$(jq -n --arg commitSha "${GITHUB_SHA}" --arg ref "${GITHUB_REF}" --argjson sarif "${sarif}" '{commitSha:$commitSha,ref:$ref,sarif:$sarif}')"
           upload="$(curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" -H 'Content-Type: application/json' --data-binary "${payload}" "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif")"
           expected_sha="$(jq -er '.artifact.payloadSha256' <<<"${upload}")"
-          curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif?raw=true" --output "${RUNNER_TEMP}/guardx-ci.sarif"
-          test "$(sha256sum "${RUNNER_TEMP}/guardx-ci.sarif" | awk '{print $1}')" = "${expected_sha}"
+          curl --fail-with-body --silent --show-error -D "${RUNNER_TEMP}/guardx-ci.headers" -H "Authorization: Bearer ${GUARDX_TOKEN}" "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif?raw=true" --output "${RUNNER_TEMP}/guardx-ci.sarif"
+          received_sha="$(awk 'BEGIN{IGNORECASE=1} /^X-GuardX-SARIF-SHA256:/{gsub("\\r",""); print $2}' "${RUNNER_TEMP}/guardx-ci.headers")"
+          test "${received_sha}" = "${expected_sha}"
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' "${RUNNER_TEMP}/guardx-ci.sarif" >/dev/null
 
       - name: Publish SARIF to GitHub code scanning
         shell: bash
