@@ -61,15 +61,6 @@ jobs:
           test "${received_sha}" = "${expected_sha}"
           jq -e '.version == "2.1.0" and (.runs | type == "array")' "${RUNNER_TEMP}/guardx-ci.sarif" >/dev/null
 
-      - name: Publish SARIF to GitHub code scanning
-        shell: bash
-        env:
-          GUARDX_TOKEN: ${{ steps.auth.outputs.access_token }}
-          SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
-        run: |
-          set -euo pipefail
-          curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" -H 'Content-Type: application/json' --data '{}' "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif/github" >/dev/null
-
       - name: Wait for GuardX result
         shell: bash
         env:
@@ -85,3 +76,12 @@ jobs:
           done
           echo 'GuardX scan timed out' >&2
           exit 1
+
+      - name: Publish authoritative SARIF to GitHub code scanning
+        shell: bash
+        env:
+          GUARDX_TOKEN: ${{ steps.auth.outputs.access_token }}
+          SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" -H 'Content-Type: application/json' --data '{}' "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif/github" >/dev/null
