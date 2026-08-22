@@ -1,0 +1,85 @@
+name: GuardX OIDC acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  guardx:
+    runs-on: ubuntu-latest
+    env:
+      GUARDX_API_URL: https://gxapi.sirez.com
+      GUARDX_PROPERTY_ID: ${{ vars.GUARDX_PROPERTY_ID }}
+      GUARDX_OIDC_AUDIENCE: https://gxapi.sirez.com/api/v2/ci/oidc/exchange
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Exchange GitHub workload identity
+        id: auth
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl --fail-with-body --silent --show-error -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${GUARDX_OIDC_AUDIENCE}")"
+          oidc_token="$(jq -er '.value' <<<"${oidc_response}")"
+          exchange_response="$(jq -n --arg token "${oidc_token}" '{subjectToken:$token}' | curl --fail-with-body --silent --show-error -H 'Content-Type: application/json' --data-binary @- "${GUARDX_API_URL}/api/v2/ci/oidc/exchange")"
+          access_token="$(jq -er '.accessToken' <<<"${exchange_response}")"
+          echo "::add-mask::${access_token}"
+          echo "access_token=${access_token}" >>"${GITHUB_OUTPUT}"
+
+      - name: Submit exact commit
+        id: submit
+        shell: bash
+        env:
+          GUARDX_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -n --arg propertyId "${GUARDX_PROPERTY_ID}" --arg repository "https://github.com/${GITHUB_REPOSITORY}" --arg commitSha "${GITHUB_SHA}" --arg ref "${GITHUB_REF}" --arg buildId "${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}" '{propertyId:$propertyId,repository:$repository,commitSha:$commitSha,ref:$ref,build:{provider:"github-actions",id:$buildId},products:["sast","sca","iac","secrets","sbom"],profile:"full"}')"
+          response="$(curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" -H 'Content-Type: application/json' -H "Idempotency-Key: github-actions:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}" --data-binary "${payload}" "${GUARDX_API_URL}/api/v2/ci/submissions")"
+          echo "submission_id=$(jq -er '.submissionId' <<<"${response}")" >>"${GITHUB_OUTPUT}"
+
+      - name: Attach provenance and private SARIF
+        shell: bash
+        env:
+          GUARDX_TOKEN: ${{ steps.auth.outputs.access_token }}
+          SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+        run: |
+          set -euo pipefail
+          git archive --format=tar --output="${RUNNER_TEMP}/guardx-source.tar" "${GITHUB_SHA}"
+          artifact_sha="$(sha256sum "${RUNNER_TEMP}/guardx-source.tar" | awk '{print $1}')"
+          statement="$(jq -n --arg repository "https://github.com/${GITHUB_REPOSITORY}" --arg commitSha "${GITHUB_SHA}" --arg ref "${GITHUB_REF}" --arg workflowRef "${GITHUB_WORKFLOW_REF}" --arg invocationId "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" --arg artifactName "guardx-source-${GITHUB_SHA}.tar" --arg artifactSha "${artifact_sha}" '{_type:"https://in-toto.io/Statement/v1",subject:[{name:$artifactName,digest:{sha256:$artifactSha}}],predicateType:"https://slsa.dev/provenance/v1",predicate:{buildDefinition:{buildType:"https://github.com/Attestations/GitHubActionsWorkflow@v1",externalParameters:{repository:$repository,commitSha:$commitSha,ref:$ref}},runDetails:{builder:{id:("https://github.com/"+$workflowRef)},metadata:{invocationId:$invocationId}}}}')"
+          curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" -H 'Content-Type: application/json' --data-binary "${statement}" "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/attestations/provenance" >/dev/null
+          sarif="$(jq -n '{version:"2.1.0",runs:[{tool:{driver:{name:"GuardX GitHub Actions acceptance",version:"1"}},results:[]}]}')"
+          payload="$(jq -n --arg commitSha "${GITHUB_SHA}" --arg ref "${GITHUB_REF}" --argjson sarif "${sarif}" '{commitSha:$commitSha,ref:$ref,sarif:$sarif}')"
+          upload="$(curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" -H 'Content-Type: application/json' --data-binary "${payload}" "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif")"
+          expected_sha="$(jq -er '.artifact.payloadSha256' <<<"${upload}")"
+          curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif?raw=true" --output "${RUNNER_TEMP}/guardx-ci.sarif"
+          test "$(sha256sum "${RUNNER_TEMP}/guardx-ci.sarif" | awk '{print $1}')" = "${expected_sha}"
+
+      - name: Publish SARIF to GitHub code scanning
+        shell: bash
+        env:
+          GUARDX_TOKEN: ${{ steps.auth.outputs.access_token }}
+          SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" -H 'Content-Type: application/json' --data '{}' "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}/artifacts/sarif/github" >/dev/null
+
+      - name: Wait for GuardX result
+        shell: bash
+        env:
+          GUARDX_TOKEN: ${{ steps.auth.outputs.access_token }}
+          SUBMISSION_ID: ${{ steps.submit.outputs.submission_id }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 108); do
+            response="$(curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${GUARDX_TOKEN}" "${GUARDX_API_URL}/api/v2/ci/submissions/${SUBMISSION_ID}")"
+            status="$(jq -er '.status' <<<"${response}")"
+            case "${status}" in completed) exit 0;; completed_with_warnings|partial|failed|cancelled) jq . <<<"${response}"; exit 1;; esac
+            sleep 5
+          done
+          echo 'GuardX scan timed out' >&2
+          exit 1
